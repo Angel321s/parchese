@@ -1,0 +1,26 @@
+name: Pruebas
+
+on:
+  push:
+  pull_request:
+
+jobs:
+  pruebas:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '21'
+      - run: npm ci
+      - name: Cálculo de comisiones
+        run: npm run test:unit
+      - name: Reglas de seguridad (emulador de Firestore)
+        run: npm run test:rules
+      - name: Compilar el sitio
+        run: npm run build
