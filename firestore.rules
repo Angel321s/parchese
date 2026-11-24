@@ -1,0 +1,234 @@
+rules_version = '2';
+
+// Reglas de seguridad de Párchese.
+//
+// Quién puede hacer qué:
+// - Cualquiera: ver bares activos y eventos publicados.
+// - Cliente con sesión: comprar entradas (el cupo se valida aquí), ver solo sus pedidos
+//   y avisar "Ya pagué". No puede confirmar su propio pago.
+// - Personal del bar: correo verificado que esté en barsPrivate/{barId}.staffEmails.
+//   Ve los pedidos de su bar, confirma o rechaza pagos, marca la entrada en la puerta
+//   y maneja los eventos de su bar.
+// - Administración de Párchese: correo verificado que esté en config/admins.emails.
+//   Crea bares, agrega personal y registra las comisiones pagadas.
+//
+// Estados de un pedido:
+//   pendiente -> confirmado -> usado
+//   pendiente -> rechazado            (el pago no llegó)
+//   confirmado -> reembolsado         (el bar devolvió la plata)
+//   Las entradas gratis (total 0) nacen confirmadas.
+
+service cloud.firestore {
+  match /databases/{database}/documents {
+
+    // ---------- quién es quién ----------
+
+    function signedIn() {
+      return request.auth != null;
+    }
+
+    function myEmail() {
+      return request.auth.token.email;
+    }
+
+    function verified() {
+      return signedIn()
+        && request.auth.token.email_verified == true
+        && request.auth.token.email is string;
+    }
+
+    function isAdmin() {
+      return verified()
+        && exists(/databases/$(database)/documents/config/admins)
+        && myEmail() in get(/databases/$(database)/documents/config/admins).data.emails;
+    }
+
+    function isStaffOf(barId) {
+      return verified()
+        && exists(/databases/$(database)/documents/barsPrivate/$(barId))
+        && myEmail() in get(/databases/$(database)/documents/barsPrivate/$(barId)).data.staffEmails;
+    }
+
+    function canManage(barId) {
+      return isStaffOf(barId) || isAdmin();
+    }
+
+    function changedKeys() {
+      return request.resource.data.diff(resource.data).affectedKeys();
+    }
+
+    // ---------- administración ----------
+
+    // Se crea a mano en la consola de Firebase: config/admins { emails: ["tu@correo.com"] }
+    match /config/admins {
+      allow get: if verified() && myEmail() in resource.data.emails;
+      allow list, create, update, delete: if false;
+    }
+
+    // ---------- bares ----------
+
+    function validBar(d) {
+      return d.name is string && d.name.size() > 0 && d.name.size() <= 60
+        && d.active is bool
+        && d.brebKey is string && d.brebKey.size() <= 60;
+    }
+
+    // Leer un documento que no existe solo dice "no existe" (resource == null).
+    match /bars/{barId} {
+      allow get: if resource == null || resource.data.active == true || canManage(barId);
+      allow list: if resource.data.active == true || isAdmin();
+      allow create, update: if isAdmin() && validBar(request.resource.data);
+      allow delete: if false;
+    }
+
+    // Datos internos del bar: personal, comisión y oferta de lanzamiento.
+    match /barsPrivate/{barId} {
+      allow read: if isAdmin() || (verified() && myEmail() in resource.data.staffEmails);
+      allow create, update: if isAdmin()
+        && request.resource.data.staffEmails is list
+        && request.resource.data.commissionRate is number
+        && request.resource.data.commissionRate >= 0
+        && request.resource.data.commissionRate <= 0.5
+        && request.resource.data.freeEvents is int;
+      allow delete: if false;
+    }
+
+    // ---------- eventos ----------
+
+    function validEvent(d) {
+      return d.barId is string
+        && d.title is string && d.title.size() > 0 && d.title.size() <= 80
+        && d.startsAt is timestamp
+        && d.status in ['draft', 'published', 'cancelled']
+        && d.ticketTypes is map && d.ticketTypes.size() <= 8
+        && d.sold is map;
+    }
+
+    // Un cliente solo puede sumar al contador de vendidas exactamente lo que compra
+    // en el mismo envío (el pedido nuevo y el contador van juntos), sin pasarse del cupo.
+    // capacity 0 = sin límite.
+    function saleIncrement(eventId) {
+      let oid = request.resource.data.lastOrderId;
+      let o = getAfter(/databases/$(database)/documents/orders/$(oid)).data;
+      let t = o.typeId;
+      let before = resource.data.sold.get(t, 0);
+      let after = request.resource.data.sold.get(t, 0);
+      let cap = resource.data.ticketTypes[t].capacity;
+      return signedIn()
+        && changedKeys().hasOnly(['sold', 'lastOrderId'])
+        && request.resource.data.sold.diff(resource.data.sold).affectedKeys().hasOnly([t])
+        && !exists(/databases/$(database)/documents/orders/$(oid))
+        && o.uid == request.auth.uid
+        && o.eventId == eventId
+        && after == before + o.qty
+        && (cap == 0 || after <= cap);
+    }
+
+    match /events/{eventId} {
+      allow get: if resource == null || resource.data.status == 'published' || canManage(resource.data.barId);
+      allow list: if resource.data.status == 'published' || canManage(resource.data.barId);
+      allow create: if canManage(request.resource.data.barId)
+        && validEvent(request.resource.data)
+        && request.resource.data.sold.size() == 0;
+      allow update: if (canManage(resource.data.barId)
+            && request.resource.data.barId == resource.data.barId
+            && validEvent(request.resource.data))
+        || saleIncrement(eventId);
+      allow delete: if canManage(resource.data.barId) && resource.data.status == 'draft';
+    }
+
+    // ---------- pedidos (entradas y reservas) ----------
+
+    function validNewOrder(code) {
+      let d = request.resource.data;
+      let evPath = /databases/$(database)/documents/events/$(d.eventId);
+      let ev = get(evPath).data;
+      let evAfter = getAfter(evPath).data;
+      let tt = ev.ticketTypes[d.typeId];
+      return signedIn()
+        && code.matches('^PRCH-[A-HJ-NP-Z2-9]{6}$')
+        && d.keys().hasOnly(['uid', 'code', 'eventId', 'barId', 'typeId', 'typeName', 'qty',
+                             'unitPrice', 'total', 'status', 'name', 'phone', 'email', 'consent',
+                             'createdAt', 'eventTitle', 'eventStartsAt', 'barName'])
+        && d.uid == request.auth.uid
+        && d.code == code
+        && ev.status == 'published'
+        && request.time < ev.startsAt + duration.value(6, 'h')
+        && d.barId == ev.barId
+        && d.eventTitle == ev.title
+        && d.eventStartsAt == ev.startsAt
+        && d.typeName == tt.name
+        && d.qty is int && d.qty >= 1 && d.qty <= 10
+        && d.unitPrice == tt.price
+        && d.total == tt.price * d.qty
+        && ((d.total == 0 && d.status == 'confirmado') || (d.total > 0 && d.status == 'pendiente'))
+        && d.consent == true
+        && d.name is string && d.name.size() >= 2 && d.name.size() <= 60
+        && d.phone is string && d.phone.size() >= 7 && d.phone.size() <= 20
+        && d.barName is string && d.barName.size() <= 60
+        && d.createdAt == request.time
+        && evAfter.lastOrderId == code
+        && evAfter.sold.get(d.typeId, 0) == ev.sold.get(d.typeId, 0) + d.qty;
+    }
+
+    // El cliente avisa que ya pagó por Bre-B (no cambia el estado).
+    function customerClaimsPaid() {
+      return signedIn()
+        && resource.data.uid == request.auth.uid
+        && resource.data.status == 'pendiente'
+        && changedKeys().hasOnly(['paidClaimAt', 'payerName'])
+        && request.resource.data.paidClaimAt == request.time
+        && request.resource.data.payerName is string
+        && request.resource.data.payerName.size() <= 60;
+    }
+
+    // El bar confirma el pago, rechaza, marca la entrada en la puerta o registra un reembolso.
+    function staffUpdatesOrder() {
+      let before = resource.data.status;
+      let d = request.resource.data;
+      return canManage(resource.data.barId)
+        && changedKeys().hasOnly(['status', 'confirmedAt', 'confirmedBy', 'usedAt', 'usedBy',
+                                  'closedAt', 'closedBy', 'note'])
+        && (
+          (before == 'pendiente' && d.status == 'confirmado'
+            && d.confirmedAt == request.time && d.confirmedBy == myEmail())
+          || (before == 'confirmado' && d.status == 'usado'
+            && d.usedAt == request.time && d.usedBy == myEmail())
+          || (before == 'pendiente' && d.status == 'rechazado'
+            && d.closedAt == request.time && d.closedBy == myEmail())
+          || (before == 'confirmado' && d.status == 'reembolsado'
+            && d.closedAt == request.time && d.closedBy == myEmail())
+        );
+    }
+
+    match /orders/{code} {
+      allow get: if signedIn()
+        && (resource == null || resource.data.uid == request.auth.uid || canManage(resource.data.barId));
+      allow list: if signedIn()
+        && (resource.data.uid == request.auth.uid || canManage(resource.data.barId));
+      allow create: if validNewOrder(code);
+      allow update: if customerClaimsPaid() || staffUpdatesOrder();
+      allow delete: if false;
+    }
+
+    // ---------- comisiones liquidadas (una por evento) ----------
+
+    match /settlements/{eventId} {
+      allow read: if signedIn() && canManage(resource.data.barId);
+      allow create, update: if isAdmin()
+        && request.resource.data.barId is string
+        && request.resource.data.amount is int;
+      allow delete: if isAdmin();
+    }
+
+    // ---------- perfil del cliente (para no volver a escribir nombre y WhatsApp) ----------
+
+    match /users/{uid} {
+      allow read, delete: if signedIn() && request.auth.uid == uid;
+      allow create, update: if signedIn() && request.auth.uid == uid
+        && request.resource.data.keys().hasOnly(['name', 'phone', 'updatedAt'])
+        && request.resource.data.name is string && request.resource.data.name.size() <= 60
+        && request.resource.data.phone is string && request.resource.data.phone.size() <= 20;
+    }
+  }
+}
